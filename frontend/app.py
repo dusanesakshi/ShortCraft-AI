@@ -568,83 +568,88 @@ with preview_col:
                     key="voice_sample_text",
                 )
 
-                if st.button("▶ Preview voice", use_container_width=True):
-                    if not sample_text.strip():
-                        st.warning("Enter sample text.")
-                    else:
-                        try:
-                            with st.spinner("Generating voice sample..."):
-                                audio_bytes = generate_voice_sample(
-                                    sample_text,
-                                    selected_voice["ShortName"],
-                                )
-                            st.audio(audio_bytes, format="audio/mp3")
-                        except Exception as exc:
-                            st.error("Voice sample generation failed.")
-                            st.caption(str(exc))
+                preview_btn_col, _ = st.columns([1, 1])
+                with preview_btn_col:
+                    if st.button("▶ Preview voice", use_container_width=True):
+                        if not sample_text.strip():
+                            st.warning("Enter sample text.")
+                        else:
+                            try:
+                                with st.spinner("Generating voice sample..."):
+                                    audio_bytes = generate_voice_sample(
+                                        sample_text,
+                                        selected_voice["ShortName"],
+                                    )
+                                st.audio(audio_bytes, format="audio/mp3")
+                            except Exception as exc:
+                                st.error("Voice sample generation failed.")
+                                st.caption(str(exc))
             else:
                 st.warning("No voices match these filters.")
 
         except Exception as exc:
             st.error("Could not load online voices.")
             st.caption(str(exc))
-    st.markdown("### Narration audio")
 
-if st.button(
-    "Generate narration audio",
-    use_container_width=True,
-    type="primary"
-):
-    script_text = st.session_state.get(
-        "script_editor",
-        ""
-    ).strip()
-
-    selected_voice = st.session_state.get(
-        "selected_voice"
+    st.markdown("---")
+    st.markdown(
+        '<div class="section-heading">Narration audio</div>',
+        unsafe_allow_html=True,
     )
 
-    if not script_text:
-        st.warning(
-            "Generate or enter a script before creating narration."
-        )
+    gen_col, _ = st.columns([1, 1])
+    with gen_col:
+        if st.button(
+            "Generate narration audio",
+            use_container_width=True,
+            type="primary",
+        ):
+            script_text = st.session_state.get("script_editor", "").strip()
+            selected_voice = st.session_state.get("selected_voice")
 
-    elif not selected_voice:
-        st.warning(
-            "Please open Voice settings and select a voice first."
-        )
-
-    else:
-        try:
-            with st.spinner("Generating narration audio..."):
-                audio_bytes = generate_narration_audio(
-                    text=script_text,
-                    voice_name=selected_voice["ShortName"],
-                    speed=speed
+            if not script_text:
+                st.warning(
+                    "Generate or enter a script before creating narration."
                 )
+            elif not selected_voice:
+                st.warning(
+                    "Please open Voice settings and select a voice first."
+                )
+            else:
+                try:
+                    with st.spinner("Generating narration audio..."):
+                        audio_bytes = generate_narration_audio(
+                            text=script_text,
+                            voice_name=selected_voice["ShortName"],
+                            speed=speed,
+                        )
 
-            st.session_state["narration_audio"] = audio_bytes
-            st.session_state["narration_script"] = script_text
+                    st.session_state["narration_audio"] = audio_bytes
+                    st.session_state["narration_script"] = script_text
 
-            st.success("Narration audio generated successfully.")
+                    st.toast(
+                        "Narration audio generated successfully.",
+                        icon="✅",
+                    )
 
-        except Exception as e:
-            st.error(f"Could not generate narration: {e}")
+                except Exception as e:
+                    st.error(f"Could not generate narration: {e}")
 
+    if st.session_state.get("narration_audio"):
+        st.audio(
+            st.session_state["narration_audio"],
+            format="audio/mp3",
+        )
 
-if st.session_state.get("narration_audio"):
-    st.audio(
-        st.session_state["narration_audio"],
-        format="audio/mp3"
-    )
-
-    st.download_button(
-        label="Download narration MP3",
-        data=st.session_state["narration_audio"],
-        file_name="shortcraft_narration.mp3",
-        mime="audio/mpeg",
-        use_container_width=True
-    )
+        dl_col, _ = st.columns([1, 1])
+        with dl_col:
+            st.download_button(
+                label="Download narration MP3",
+                data=st.session_state["narration_audio"],
+                file_name="shortcraft_narration.mp3",
+                mime="audio/mpeg",
+                use_container_width=True,
+            )
 
     st.markdown("---")
     st.caption(
