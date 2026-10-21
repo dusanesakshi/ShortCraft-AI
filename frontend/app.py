@@ -1,9 +1,31 @@
 import asyncio
+import base64
+import json
 import os
+import subprocess
 import tempfile
-import requests
+from pathlib import Path
+
 import edge_tts
+import requests
 import streamlit as st
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env")
+
+
+def format_api_error_detail(detail):
+    """Format FastAPI validation errors for Streamlit display."""
+    if isinstance(detail, list):
+        lines = []
+        for item in detail:
+            loc = item.get("loc", ())
+            msg = item.get("msg", item)
+            field = ".".join(str(part) for part in loc if part != "body")
+            lines.append(f"{field}: {msg}" if field else str(msg))
+        return "\n".join(lines)
+    return str(detail)
 
 
 # ---------------------------------------------------------
@@ -229,16 +251,24 @@ def generate_voice_sample(text, voice_name):
         if path and os.path.exists(path):
             os.remove(path)
 
-def generate_narration_audio(text, voice_name, speed):
+def _word_boundary_to_seconds(offset: float, duration: float) -> tuple[float, float]:
+    # Edge TTS reports offset/duration in 100-nanosecond units.
+    start = offset / 10_000_000
+    end = (offset + duration) / 10_000_000
+    return start, end
+
+
+def generate_narration_audio_with_words(text, voice_name, speed):
     path = None
 
     try:
         rate_percent = round((speed - 1.0) * 100)
         rate = f"{rate_percent:+d}%"
+        word_timings: list[dict] = []
 
         with tempfile.NamedTemporaryFile(
             suffix=".mp3",
-            delete=False
+            delete=False,
         ) as temp:
             path = temp.name
 
@@ -246,18 +276,136 @@ def generate_narration_audio(text, voice_name, speed):
             communicate = edge_tts.Communicate(
                 text=text,
                 voice=voice_name,
-                rate=rate
+                rate=rate,
+                boundary="WordBoundary",
             )
-            await communicate.save(path)
+            with open(path, "wb") as audio_file:
+                async for chunk in communicate.stream():
+                    if chunk["type"] == "audio":
+                        audio_file.write(chunk["data"])
+                    elif chunk["type"] == "WordBoundary":
+                        word = (chunk.get("text") or "").strip()
+                        if not word:
+                            continue
+                        start, end = _word_boundary_to_seconds(
+                            chunk["offset"],
+                            chunk["duration"],
+                        )
+                        word_timings.append(
+                            {"text": word, "start": start, "end": end}
+                        )
 
         asyncio.run(generate())
 
         with open(path, "rb") as audio_file:
-            return audio_file.read()
+            return audio_file.read(), word_timings
 
     finally:
         if path and os.path.exists(path):
             os.remove(path)
+
+
+def generate_narration_audio(text, voice_name, speed):
+    audio_bytes, _word_timings = generate_narration_audio_with_words(
+        text,
+        voice_name,
+        speed,
+    )
+    return audio_bytes
+
+
+def _ffprobe_path() -> str:
+    ffmpeg_path = Path(os.getenv("FFMPEG_PATH", ""))
+    if not ffmpeg_path.is_file():
+        raise RuntimeError("FFMPEG_PATH is missing or invalid in the project .env file.")
+    probe_name = "ffprobe.exe" if ffmpeg_path.suffix.lower() == ".exe" else "ffprobe"
+    probe_path = ffmpeg_path.with_name(probe_name)
+    if not probe_path.is_file():
+        raise RuntimeError(f"ffprobe was not found next to FFmpeg at: {probe_path}")
+    return str(probe_path)
+
+
+def probe_mp3_duration_seconds(mp3_bytes: bytes) -> float:
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp:
+        temp.write(mp3_bytes)
+        temp_path = temp.name
+
+    try:
+        command = [
+            _ffprobe_path(),
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            temp_path,
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Could not read MP3 duration.")
+        payload = json.loads(result.stdout)
+        return float(payload["format"]["duration"])
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def concat_mp3_bytes(first_bytes: bytes, second_bytes: bytes) -> bytes:
+    ffmpeg_path = os.getenv("FFMPEG_PATH")
+    if not ffmpeg_path or not os.path.isfile(ffmpeg_path):
+        raise RuntimeError("FFMPEG_PATH is missing or invalid in the project .env file.")
+
+    work_dir = Path(tempfile.mkdtemp())
+    first_path = work_dir / "part1.mp3"
+    second_path = work_dir / "part2.mp3"
+    concat_list = work_dir / "concat.txt"
+    output_path = work_dir / "combined.mp3"
+
+    try:
+        first_path.write_bytes(first_bytes)
+        second_path.write_bytes(second_bytes)
+        concat_list.write_text(
+            f"file '{first_path.as_posix()}'\nfile '{second_path.as_posix()}'\n",
+            encoding="utf-8",
+        )
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_list),
+            "-c",
+            "copy",
+            str(output_path),
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Could not merge title and script narration audio.")
+        return output_path.read_bytes()
+    finally:
+        for path in (first_path, second_path, concat_list, output_path):
+            if path.exists():
+                path.unlink()
+        if work_dir.exists():
+            work_dir.rmdir()
+
+
 # ---------------------------------------------------------
 # Header
 # ---------------------------------------------------------
@@ -428,16 +576,182 @@ with editor_col:
 
     st.caption(f"{len(script.split())} words · Editable narration")
 
+    # ---------------------------------------------------------
+    # Reddit introduction card
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.markdown(
+        '<div class="section-heading">Reddit introduction card</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.caption(
+        "Customize the card shown before the narration starts."
+    )
+
+    has_card = bool(st.session_state.get("reddit_card_image"))
+
+    with st.expander(
+        "Customize Reddit intro card",
+        expanded=not has_card,
+    ):
+        card_username = st.text_input(
+            "Display handle",
+            value="Anonymous",
+            placeholder="@YourHandle",
+            key="card_username",
+        )
+
+        card_avatar = st.file_uploader(
+            "Profile picture (optional)",
+            type=["png", "jpg", "jpeg", "webp"],
+            key="card_avatar",
+        )
+        st.caption(
+            "Leave empty for a generated avatar from your handle."
+        )
+
+        card_title = st.text_area(
+            "Reddit post title",
+            placeholder="Enter the heading shown on the card...",
+            height=90,
+            key="card_title",
+        )
+
+        card_subreddit = st.text_input(
+            "Subreddit",
+            value="r/AmItheAsshole",
+            key="card_subreddit",
+        )
+
+        card_verified = st.checkbox(
+            "Show verification badge",
+            value=False,
+            key="card_verified",
+        )
+
+        card_col1, card_col2 = st.columns(2)
+
+        with card_col1:
+            card_upvotes = st.text_input(
+                "Upvotes",
+                value="99+",
+                key="card_upvotes",
+            )
+
+        with card_col2:
+            card_comments = st.text_input(
+                "Comments",
+                value="99+",
+                key="card_comments",
+            )
+
+        if st.button(
+            "Generate Reddit Card",
+            use_container_width=True,
+            key="generate_reddit_card",
+        ):
+            if not card_title.strip():
+                st.warning("Please enter the Reddit post title.")
+            else:
+                try:
+                    with st.spinner("Rendering Reddit card..."):
+                        payload = {
+                            "username": card_username.strip(),
+                            "title": card_title.strip(),
+                            "subreddit": card_subreddit.strip(),
+                            "verified": card_verified,
+                            "upvotes": card_upvotes.strip(),
+                            "comments": card_comments.strip(),
+                        }
+                        if card_avatar is not None:
+                            payload["avatar_base64"] = base64.b64encode(
+                                card_avatar.getvalue()
+                            ).decode("ascii")
+
+                        response = requests.post(
+                            "http://127.0.0.1:8000/api/v1/card/render",
+                            json=payload,
+                            timeout=30,
+                        )
+
+                        response.raise_for_status()
+
+                        st.session_state["reddit_card_image"] = (
+                            response.content
+                        )
+                        st.session_state["reddit_card_summary"] = {
+                            "username": card_username.strip(),
+                            "title": card_title.strip(),
+                            "subreddit": card_subreddit.strip(),
+                        }
+
+                    st.toast(
+                        "Reddit card generated successfully!",
+                        icon="✅",
+                    )
+
+                except requests.RequestException as exc:
+                    st.error("Could not generate Reddit card.")
+
+                    if exc.response is not None:
+                        st.error(exc.response.text)
+                    else:
+                        st.error(str(exc))
+
+        if st.session_state.get("reddit_card_image"):
+            st.markdown("#### Card preview")
+
+            st.image(
+                st.session_state["reddit_card_image"],
+                width=330,
+            )
+
+    if st.session_state.get("reddit_card_image"):
+        summary = st.session_state.get("reddit_card_summary") or {}
+        username = summary.get(
+            "username",
+            st.session_state.get("card_username", "Anonymous"),
+        )
+        subreddit = summary.get(
+            "subreddit",
+            st.session_state.get("card_subreddit", ""),
+        )
+        title = summary.get("title", st.session_state.get("card_title", ""))
+        title_short = title if len(title) <= 60 else f"{title[:57]}..."
+
+        #st.caption("Intro card ready")
+        #st.caption(
+        #    f"u/{username} · {subreddit} · {title_short}"
+        #)
+
+        card_dl_col, _ = st.columns([1, 1])
+        with card_dl_col:
+            st.download_button(
+                "Download Reddit Card",
+                data=st.session_state["reddit_card_image"],
+                file_name="shortcraft_reddit_card.png",
+                mime="image/png",
+                use_container_width=True,
+            )
+
     st.markdown("---")
     st.markdown(
         '<div class="section-heading">Background footage</div>',
         unsafe_allow_html=True,
     )
+
     if "background_video_uploader_key" not in st.session_state:
         st.session_state.background_video_uploader_key = 0
 
     if st.session_state.pop("clear_video", False):
         st.session_state.background_video_uploader_key += 1
+        for key in (
+            "background_video_name",
+            "background_video_bytes",
+            "background_video_type",
+        ):
+            st.session_state.pop(key, None)
 
     uploaded_video = st.file_uploader(
         "Upload your background video",
@@ -447,6 +761,15 @@ with editor_col:
     )
 
     if uploaded_video is not None:
+        video_bytes = uploaded_video.getvalue()
+        if video_bytes:
+            st.session_state["background_video_name"] = uploaded_video.name
+            st.session_state["background_video_bytes"] = video_bytes
+            mime = uploaded_video.type or "video/mp4"
+            if uploaded_video.name.lower().endswith(".webm") and mime == "application/octet-stream":
+                mime = "video/webm"
+            st.session_state["background_video_type"] = mime
+
         st.caption(
             f"{uploaded_video.name} · "
             f"{uploaded_video.size / (1024 * 1024):.1f} MB"
@@ -608,24 +931,56 @@ with preview_col:
             selected_voice = st.session_state.get("selected_voice")
 
             if not script_text:
-                st.warning(
+                st.toast(
                     "Generate or enter a script before creating narration."
                 )
             elif not selected_voice:
-                st.warning(
+                st.toast(
                     "Please open Voice settings and select a voice first."
                 )
             else:
                 try:
+                    summary = st.session_state.get("reddit_card_summary") or {}
+                    card_title = summary.get(
+                        "title",
+                        st.session_state.get("card_title", ""),
+                    ).strip()
+
                     with st.spinner("Generating narration audio..."):
-                        audio_bytes = generate_narration_audio(
-                            text=script_text,
-                            voice_name=selected_voice["ShortName"],
-                            speed=speed,
+                        script_bytes, script_words = (
+                            generate_narration_audio_with_words(
+                                text=script_text,
+                                voice_name=selected_voice["ShortName"],
+                                speed=speed,
+                            )
                         )
+
+                        if card_title:
+                            title_bytes, title_words = (
+                                generate_narration_audio_with_words(
+                                    text=card_title,
+                                    voice_name=selected_voice["ShortName"],
+                                    speed=speed,
+                                )
+                            )
+                            title_duration = probe_mp3_duration_seconds(title_bytes)
+                            audio_bytes = concat_mp3_bytes(
+                                title_bytes,
+                                script_bytes,
+                            )
+                            for word in script_words:
+                                word["start"] += title_duration
+                                word["end"] += title_duration
+                            caption_word_timings = title_words + script_words
+                        else:
+                            title_duration = 0.0
+                            audio_bytes = script_bytes
+                            caption_word_timings = script_words
 
                     st.session_state["narration_audio"] = audio_bytes
                     st.session_state["narration_script"] = script_text
+                    st.session_state["title_audio_duration"] = title_duration
+                    st.session_state["caption_word_timings"] = caption_word_timings
 
                     st.toast(
                         "Narration audio generated successfully.",
@@ -652,7 +1007,116 @@ with preview_col:
             )
 
     st.markdown("---")
+    st.markdown('<div class="section-heading">Create your Short</div>', unsafe_allow_html=True)
     st.caption(
-        "The source clip can be previewed here. "
-        "Narration, captions, and MP4 export will be connected in the next phase."
+        "Gameplay runs from the first frame with the Reddit card on top. "
+        "Narration speaks the card title first, then continues with your script."
     )
+
+    intro_duration = st.selectbox(
+        "Reddit intro duration",
+        options=[2.0, 3.0, 4.0],
+        index=1,
+        format_func=lambda value: f"{value:g} seconds",
+        key="intro_duration",
+    )
+
+    caption_style = st.selectbox(
+        "Caption style",
+        options=[
+            "Classic Bold",
+            "Highlighted Words",
+            "Karaoke / Word-by-Word",
+            "Sentence Captions",
+            "Reddit Story Style",
+        ],
+        index=0,
+        key="caption_style",
+        help=(
+            "Classic Bold burns centered word-by-word captions synced to your "
+            "narration. Regenerate narration after script changes."
+        ),
+    )
+    if caption_style != "Classic Bold":
+        st.caption("Only Classic Bold captions are rendered in this export.")
+
+    if st.button("Generate Short", type="primary", use_container_width=True, key="generate_short"):
+        narration_bytes = st.session_state.get("narration_audio")
+        card_bytes = st.session_state.get("reddit_card_image")
+        background_bytes = st.session_state.get("background_video_bytes")
+        background_name = st.session_state.get(
+            "background_video_name",
+            "background.mp4",
+        )
+        background_type = st.session_state.get(
+            "background_video_type",
+            "video/mp4",
+        )
+
+        if not background_bytes:
+            st.warning("Upload background footage first.")
+        elif not narration_bytes:
+            st.warning("Generate narration audio first.")
+        elif not card_bytes:
+            st.warning("Generate the Reddit introduction card first.")
+        else:
+            try:
+                with st.spinner("Composing your video. Longer narration takes longer to render..."):
+                    response = requests.post(
+                        "http://127.0.0.1:8000/api/v1/video/compose-with-card",
+                        files={
+                            "background_video": (
+                                background_name,
+                                background_bytes,
+                                background_type,
+                            ),
+                            "narration_audio": (
+                                "narration.mp3", narration_bytes, "audio/mpeg"
+                            ),
+                            "card_image": (
+                                "reddit_card.png", card_bytes, "image/png"
+                            ),
+                        },
+                        data={
+                            "card_duration": str(intro_duration),
+                            "caption_style": st.session_state.get(
+                                "caption_style",
+                                "Classic Bold",
+                            ),
+                            "caption_script": st.session_state.get(
+                                "narration_script",
+                                "",
+                            ),
+                            "title_audio_duration": str(
+                                st.session_state.get("title_audio_duration", 0.0)
+                            ),
+                            "caption_word_timings": json.dumps(
+                                st.session_state.get("caption_word_timings", [])
+                            ),
+                        },
+                        timeout=3600,
+                    )
+                    response.raise_for_status()
+                    st.session_state["generated_video"] = response.content
+                    st.toast("Video created successfully.", icon="✅")
+            except requests.RequestException as exc:
+                st.error("Could not compose the video.")
+                if exc.response is not None:
+                    try:
+                        payload = exc.response.json()
+                        st.error(format_api_error_detail(payload.get("detail", payload)))
+                    except ValueError:
+                        st.error(exc.response.text)
+                else:
+                    st.error(str(exc))
+
+    if st.session_state.get("generated_video"):
+        st.markdown("#### Generated video")
+        st.video(st.session_state["generated_video"])
+        st.download_button(
+            "Download finished MP4",
+            data=st.session_state["generated_video"],
+            file_name="shortcraft_video.mp4",
+            mime="video/mp4",
+            use_container_width=True,
+        )
