@@ -57,6 +57,12 @@ ALLOWED_CARD_IMAGE_TYPES = {"image/png", "application/octet-stream"}
 VERTICAL_VIDEO_FILTER = (
     "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
 )
+CARD_OVERLAY_WIDTH = 900
+CARD_OVERLAY_TOP_Y = 260
+CARD_INTRO_ZOOM_MAX = 1.025
+CARD_INTRO_ZOOM_DELTA = CARD_INTRO_ZOOM_MAX - 1.0
+
+
 def _ffmpeg_filter_path(path: Path) -> str:
     """Escape a filesystem path for FFmpeg filter arguments (Windows-safe)."""
     return (
@@ -471,11 +477,14 @@ async def compose_video_with_card(
         main_end = card_duration + narration_duration
         compose_timeout = FFMPEG_COMPOSE_TIMEOUT_SECONDS
 
+        intro_frame_count = max(1, int(30 * card_duration))
         intro_filter = (
             f"[0:v]trim=0:{card_duration},setpts=PTS-STARTPTS,"
             f"{VERTICAL_VIDEO_FILTER}[bg];"
-            f"[1:v]scale=900:-1[card];"
-            f"[bg][card]overlay=(W-w)/2:(H-h)/2:format=auto[outv]"
+            f"[1:v]scale={CARD_OVERLAY_WIDTH}:-1,"
+            f"scale=w='{CARD_OVERLAY_WIDTH}*min({CARD_INTRO_ZOOM_MAX},"
+            f"1+{CARD_INTRO_ZOOM_DELTA}*n/{intro_frame_count})':h=-1:eval=frame[card];"
+            f"[bg][card]overlay=(W-w)/2:{CARD_OVERLAY_TOP_Y}:format=auto[outv]"
         )
         intro_command = [
             FFMPEG_PATH,

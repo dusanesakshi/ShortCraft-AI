@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -12,7 +13,8 @@ import streamlit as st
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(PROJECT_ROOT / ".env")
+ENV_PATH = PROJECT_ROOT / ".env"
+load_dotenv(ENV_PATH, override=True)
 
 
 def format_api_error_detail(detail):
@@ -213,43 +215,266 @@ def clear_story():
     st.session_state["clear_video"] = True
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_voices():
-    """Retrieve and cache the available Edge TTS voices."""
-    return asyncio.run(edge_tts.list_voices())
+FISH_TTS_URL = "https://api.fish.audio/v1/tts/stream/with-timestamp"
+FISH_MODEL = "s2.1-pro-free"
+NARRATION_CACHE_DIR = PROJECT_ROOT / "generated_videos" / "narration_cache"
+EDGE_FALLBACK_VOICES = {
+    "male": "en-US-GuyNeural",
+    "female": "en-US-JennyNeural",
+}
+
+CURATED_REDDIT_FISH_VOICES = [
+    {
+        "id": "04205de46c44475a9fec148c805a8b3b",
+        "title": "reddit",
+        "gender": "female",
+        "sample_url": "",
+    },
+    {
+        "id": "ba9f1b6bde7f4d18ac2dcea831f8783d",
+        "title": "Reddit",
+        "gender": "female",
+        "sample_url": "",
+    },
+    {
+        "id": "a4d1a512d6b94f4bad685fbfb87cd800",
+        "title": "UFR REDDIT",
+        "gender": "female",
+        "sample_url": "",
+    },
+    {
+        "id": "d215c300d52243fdb1c411e1304f4777",
+        "title": "m reddit reads",
+        "gender": "male",
+        "sample_url": "",
+    },
+    {
+        "id": "d3dd3ce9f56847ed9629ca5c9019b890",
+        "title": "Reddit male",
+        "gender": "male",
+        "sample_url": "",
+    },
+    {
+        "id": "a9fad72fe99645a0853e75694f1c2d8a",
+        "title": "Sane Reddit",
+        "gender": "male",
+        "sample_url": "",
+    },
+]
 
 
-def generate_voice_sample(text, voice_name):
-    """Generate a temporary MP3 sample and return its bytes."""
-    path = None
+class FishUnavailable(Exception):
+    """Fish refused the request because payment, quota, or the service is down."""
+
+
+class FishAuthMissing(Exception):
+    """FISH_API_KEY is not set in the project .env file."""
+
+
+class FishAuthInvalid(Exception):
+    """FISH_API_KEY was rejected by Fish Audio."""
+
+
+def _reload_env() -> None:
+    load_dotenv(ENV_PATH, override=True)
+
+
+def fish_api_key() -> str:
+    _reload_env()
+    key = os.getenv("FISH_API_KEY", "").strip()
+    if len(key) >= 2 and key[0] == key[-1] and key[0] in ('"', "'"):
+        key = key[1:-1].strip()
+    if not key:
+        raise FishAuthMissing(
+            "Add FISH_API_KEY to the project .env file. "
+            "Create one at https://fish.audio/app/api-keys"
+        )
+    return key
+
+
+def _fish_error_is_unavailable(status: int, body: str) -> bool:
+    if status in (400, 401, 404, 422):
+        return False
+    if status in (402, 429, 500, 502, 503, 504):
+        return True
+    lowered = body.lower()
+    markers = (
+        "payment",
+        "quota",
+        "credit",
+        "insufficient",
+        "billing",
+        "subscribe",
+        "subscription",
+        "fair use",
+        "rate limit",
+        "unavailable",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _cache_paths(provider: str, text: str, voice_id: str, speed: float):
+    payload = f"{provider}\n{voice_id}\n{float(speed):.2f}\n{text}"
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return (
+        NARRATION_CACHE_DIR / f"{digest}.mp3",
+        NARRATION_CACHE_DIR / f"{digest}.json",
+    )
+
+
+def _read_narration_cache(provider: str, text: str, voice_id: str, speed: float):
+    audio_path, timings_path = _cache_paths(provider, text, voice_id, speed)
+    if not audio_path.is_file() or not timings_path.is_file():
+        return None
+    try:
+        timings = json.loads(timings_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(timings, list):
+        return None
+    return audio_path.read_bytes(), timings
+
+
+def _write_narration_cache(
+    provider: str,
+    text: str,
+    voice_id: str,
+    speed: float,
+    audio_bytes: bytes,
+    word_timings: list[dict],
+):
+    audio_path, timings_path = _cache_paths(provider, text, voice_id, speed)
+    NARRATION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    audio_path.write_bytes(audio_bytes)
+    timings_path.write_text(
+        json.dumps(word_timings),
+        encoding="utf-8",
+    )
+
+
+def _curated_fish_voices() -> list[dict]:
+    return [dict(voice) for voice in CURATED_REDDIT_FISH_VOICES]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_fish_voices():
+    """Curated Reddit narrators."""
+    voices = _curated_fish_voices()
+    try:
+        fish_api_key()
+    except FishAuthMissing:
+        return {
+            "voices": voices,
+            "missing_key": True,
+            "invalid_key": False,
+        }
+
+    return {
+        "voices": voices,
+        "missing_key": False,
+        "invalid_key": False,
+    }
+
+
+def _parse_fish_sse(response) -> tuple[bytes, list[dict]]:
+    audio_chunks = []
+    alignment_by_chunk = {}
+
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("error"):
+            message = event["error"]
+            if isinstance(message, dict):
+                message = message.get("message") or json.dumps(message)
+            message = str(message)
+            if _fish_error_is_unavailable(response.status_code, message):
+                raise FishUnavailable(message)
+            raise RuntimeError(message)
+
+        audio_b64 = event.get("audio_base64")
+        if audio_b64:
+            audio_chunks.append(base64.b64decode(audio_b64))
+
+        alignment = event.get("alignment")
+        if alignment:
+            alignment_by_chunk[event.get("chunk_seq", 0)] = {
+                "offset": float(event.get("chunk_audio_offset_sec") or 0),
+                "alignment": alignment,
+            }
+
+    if not audio_chunks:
+        raise RuntimeError("Fish Audio returned no audio.")
+
+    word_timings = []
+    for chunk_seq in sorted(alignment_by_chunk):
+        item = alignment_by_chunk[chunk_seq]
+        offset = item["offset"]
+        for segment in item["alignment"].get("segments") or []:
+            word = str(segment.get("text") or "").strip()
+            if not word:
+                continue
+            start = float(segment.get("start") or 0) + offset
+            end = float(segment.get("end") or 0) + offset
+            word_timings.append({"text": word, "start": start, "end": end})
+
+    return b"".join(audio_chunks), word_timings
+
+
+def generate_fish_narration_audio_with_words(text, voice_id, speed):
+    cached = _read_narration_cache("fish", text, voice_id, speed)
+    if cached:
+        return cached
 
     try:
-        # Convert the selected speed into an Edge TTS rate adjustment.
-        rate_percent = round((speed - 1.0) * 100)
-        rate = f"{rate_percent:+d}%"
+        response_context = requests.post(
+            FISH_TTS_URL,
+            headers={
+                "Authorization": f"Bearer {fish_api_key()}",
+                "Content-Type": "application/json",
+                "model": FISH_MODEL,
+            },
+            json={
+                "text": text,
+                "reference_id": voice_id,
+                "format": "mp3",
+                "language": "en",
+                "latency": "balanced",
+                "prosody": {"speed": float(speed)},
+            },
+            stream=True,
+            timeout=180,
+        )
+    except (requests.Timeout, requests.ConnectionError) as exc:
+        raise FishUnavailable(str(exc)) from exc
 
-        with tempfile.NamedTemporaryFile(
-            suffix=".mp3",
-            delete=False
-        ) as temp:
-            path = temp.name
-
-        async def generate():
-            communicate = edge_tts.Communicate(
-                text=text,
-                voice=voice_name,
-                rate=rate
+    with response_context as response:
+        if response.status_code != 200:
+            body = response.content.decode("utf-8", errors="replace")[:800]
+            if _fish_error_is_unavailable(response.status_code, body):
+                raise FishUnavailable(
+                    body or f"Fish Audio returned HTTP {response.status_code}."
+                )
+            raise RuntimeError(
+                f"Fish Audio returned HTTP {response.status_code}: {body}"
             )
-            await communicate.save(path)
+        audio_bytes, word_timings = _parse_fish_sse(response)
 
-        asyncio.run(generate())
+    _write_narration_cache("fish", text, voice_id, speed, audio_bytes, word_timings)
+    return audio_bytes, word_timings
 
-        with open(path, "rb") as audio_file:
-            return audio_file.read()
-
-    finally:
-        if path and os.path.exists(path):
-            os.remove(path)
 
 def _word_boundary_to_seconds(offset: float, duration: float) -> tuple[float, float]:
     # Edge TTS reports offset/duration in 100-nanosecond units.
@@ -258,11 +483,22 @@ def _word_boundary_to_seconds(offset: float, duration: float) -> tuple[float, fl
     return start, end
 
 
-def generate_narration_audio_with_words(text, voice_name, speed):
+def edge_voice_for(voice: dict, voice_type: str) -> str:
+    gender = (voice.get("gender") or "").lower()
+    if gender not in EDGE_FALLBACK_VOICES:
+        gender = "female" if voice_type.lower() == "female" else "male"
+    return EDGE_FALLBACK_VOICES[gender]
+
+
+def generate_edge_narration_audio_with_words(text, voice_name, speed):
+    cached = _read_narration_cache("edge", text, voice_name, speed)
+    if cached:
+        return cached
+
     path = None
 
     try:
-        rate_percent = round((speed - 1.0) * 100)
+        rate_percent = round((float(speed) - 1.0) * 100)
         rate = f"{rate_percent:+d}%"
         word_timings: list[dict] = []
 
@@ -298,20 +534,43 @@ def generate_narration_audio_with_words(text, voice_name, speed):
         asyncio.run(generate())
 
         with open(path, "rb") as audio_file:
-            return audio_file.read(), word_timings
+            audio_bytes = audio_file.read()
 
     finally:
         if path and os.path.exists(path):
             os.remove(path)
 
+    _write_narration_cache("edge", text, voice_name, speed, audio_bytes, word_timings)
+    return audio_bytes, word_timings
 
-def generate_narration_audio(text, voice_name, speed):
-    audio_bytes, _word_timings = generate_narration_audio_with_words(
-        text,
-        voice_name,
-        speed,
+
+def narrate_sections(
+    sections: list[str],
+    fish_voice_id: str,
+    speed: float,
+    edge_voice_name: str,
+    skip_fish: bool = False,
+):
+    """Speak each section with Fish, or the free Edge voice if Fish cannot."""
+    note = (
+        "Fish Audio needs payment or is unavailable, so this used the free "
+        f"backup voice ({edge_voice_name})."
     )
-    return audio_bytes
+    if not skip_fish:
+        try:
+            spoken = [
+                generate_fish_narration_audio_with_words(section, fish_voice_id, speed)
+                for section in sections
+            ]
+            return spoken, False, ""
+        except FishUnavailable:
+            pass
+
+    spoken = [
+        generate_edge_narration_audio_with_words(section, edge_voice_name, speed)
+        for section in sections
+    ]
+    return spoken, True, note
 
 
 def _ffprobe_path() -> str:
@@ -597,7 +856,7 @@ with editor_col:
     ):
         card_username = st.text_input(
             "Display handle",
-            value="Anonymous",
+            value="Storybud01",
             placeholder="@YourHandle",
             key="card_username",
         )
@@ -711,7 +970,7 @@ with editor_col:
         summary = st.session_state.get("reddit_card_summary") or {}
         username = summary.get(
             "username",
-            st.session_state.get("card_username", "Anonymous"),
+            st.session_state.get("card_username", "Storybud01"),
         )
         subreddit = summary.get(
             "subreddit",
@@ -828,91 +1087,104 @@ with preview_col:
 
     # Collapsible voice controls: no reload button or persistent open section.
     with st.expander("🎙️ Voice settings", expanded=False):
-        try:
-            with st.spinner("Loading online voices..."):
-                voices = get_voices()
+        voice_type = st.selectbox(
+            "Voice type",
+            ["All", "Female", "Male"],
+            key="voice_type",
+        )
 
-            english_voices = [
+        voices = _curated_fish_voices()
+        fish_list_unavailable = False
+        voice_load = {
+            "missing_key": False,
+            "invalid_key": False,
+        }
+        try:
+            with st.spinner("Loading Fish Audio voices..."):
+                voice_load = get_fish_voices()
+                voices = voice_load["voices"]
+        except FishAuthInvalid as exc:
+            st.warning(str(exc))
+        except FishUnavailable as exc:
+            fish_list_unavailable = True
+            st.info(
+                "Fish Audio needs payment or is unavailable. "
+                "You can still generate with a free backup voice."
+            )
+            st.caption(str(exc))
+            voices = [
+                {
+                    "id": "",
+                    "title": "Free backup",
+                    "gender": "female",
+                    "sample_url": "",
+                    "backup_only": True,
+                },
+                {
+                    "id": "",
+                    "title": "Free backup",
+                    "gender": "male",
+                    "sample_url": "",
+                    "backup_only": True,
+                },
+            ]
+        except Exception as exc:
+            st.caption(f"Could not verify Fish Audio: {exc}")
+
+        if voice_load.get("missing_key"):
+            st.info(
+                "Add FISH_API_KEY to the project .env file to use Fish narrators. "
+                "Create one at https://fish.audio/app/api-keys"
+            )
+
+        st.session_state["fish_list_unavailable"] = fish_list_unavailable
+        st.session_state["fish_key_missing"] = voice_load.get("missing_key", False)
+        st.session_state["fish_voices_available"] = (
+            bool(voices)
+            and not fish_list_unavailable
+            and not voice_load.get("missing_key")
+        )
+
+        filtered_voices = voices
+        if voice_type != "All":
+            filtered_voices = [
                 voice
                 for voice in voices
-                if voice.get("Locale", "").startswith("en-")
+                if voice.get("gender", "").lower() == voice_type.lower()
             ]
 
-            voice_type = st.selectbox(
-                "Voice type",
-                ["All", "Female", "Male"],
-                key="voice_type",
+        if filtered_voices:
+            def voice_label(voice):
+                gender = (voice.get("gender") or "unknown").capitalize()
+                return f'{voice.get("title", "Untitled")} · {gender}'
+
+            selected_voice = st.selectbox(
+                "Choose narrator",
+                filtered_voices,
+                format_func=voice_label,
+                key="selected_backup_voice" if fish_list_unavailable else "selected_fish_voice",
             )
 
-            locale_options = sorted(
-                {voice["Locale"] for voice in english_voices}
-            )
-            selected_locale = st.selectbox(
-                "Accent / locale",
-                ["All"] + locale_options,
-                key="voice_locale",
-            )
-
-            filtered_voices = english_voices
-
-            if voice_type != "All":
-                filtered_voices = [
-                    voice
-                    for voice in filtered_voices
-                    if voice.get("Gender", "").lower()
-                    == voice_type.lower()
-                ]
-
-            if selected_locale != "All":
-                filtered_voices = [
-                    voice
-                    for voice in filtered_voices
-                    if voice.get("Locale") == selected_locale
-                ]
-
-            if filtered_voices:
-                def voice_label(voice):
-                    return (
-                        f'{voice.get("ShortName", "Unknown")} · '
-                        f'{voice.get("Gender", "Unknown")} · '
-                        f'{voice.get("Locale", "Unknown")}'
-                    )
-
-                selected_voice = st.selectbox(
-                    "Choose narrator",
-                    filtered_voices,
-                    format_func=voice_label,
-                    key="selected_voice",
-                )
-
-                sample_text = st.text_input(
-                    "Voice sample",
-                    value="Hi! Welcome to ShortCraft AI.",
-                    key="voice_sample_text",
-                )
-
-                preview_btn_col, _ = st.columns([1, 1])
-                with preview_btn_col:
-                    if st.button("▶ Preview voice", use_container_width=True):
-                        if not sample_text.strip():
-                            st.warning("Enter sample text.")
-                        else:
-                            try:
-                                with st.spinner("Generating voice sample..."):
-                                    audio_bytes = generate_voice_sample(
-                                        sample_text,
-                                        selected_voice["ShortName"],
-                                    )
-                                st.audio(audio_bytes, format="audio/mp3")
-                            except Exception as exc:
-                                st.error("Voice sample generation failed.")
-                                st.caption(str(exc))
-            else:
-                st.warning("No voices match these filters.")
-
-        except Exception as exc:
-            st.error("Could not load online voices.")
-            st.caption(str(exc))
+            preview_btn_col, _ = st.columns([1, 1])
+            with preview_btn_col:
+                if st.button("▶ Preview voice", use_container_width=True):
+                    try:
+                        with st.spinner("Generating voice sample..."):
+                            spoken, _used_fallback, note = narrate_sections(
+                                ["Welcome to ShortCraft AI."],
+                                selected_voice.get("id") or "",
+                                speed,
+                                edge_voice_for(selected_voice, voice_type),
+                                skip_fish=bool(selected_voice.get("backup_only")),
+                            )
+                        if note:
+                            st.info(note)
+                        st.audio(spoken[0][0], format="audio/mp3")
+                    except Exception as exc:
+                        st.error("Voice sample generation failed.")
+                        st.caption(str(exc))
+        elif voices:
+            st.warning("No Fish Audio voices match this voice type.")
 
     st.markdown("---")
     st.markdown(
@@ -928,13 +1200,18 @@ with preview_col:
             type="primary",
         ):
             script_text = st.session_state.get("script_editor", "").strip()
-            selected_voice = st.session_state.get("selected_voice")
+            if st.session_state.get("fish_list_unavailable"):
+                selected_voice = st.session_state.get("selected_backup_voice")
+            else:
+                selected_voice = st.session_state.get("selected_fish_voice")
 
             if not script_text:
                 st.toast(
                     "Generate or enter a script before creating narration."
                 )
-            elif not selected_voice:
+            elif not selected_voice or (
+                not selected_voice.get("id") and not selected_voice.get("backup_only")
+            ):
                 st.toast(
                     "Please open Voice settings and select a voice first."
                 )
@@ -945,24 +1222,25 @@ with preview_col:
                         "title",
                         st.session_state.get("card_title", ""),
                     ).strip()
+                    sections = [script_text]
+                    if card_title:
+                        sections = [card_title, script_text]
 
                     with st.spinner("Generating narration audio..."):
-                        script_bytes, script_words = (
-                            generate_narration_audio_with_words(
-                                text=script_text,
-                                voice_name=selected_voice["ShortName"],
-                                speed=speed,
-                            )
+                        spoken, _used_fallback, note = narrate_sections(
+                            sections,
+                            selected_voice.get("id") or "",
+                            speed,
+                            edge_voice_for(
+                                selected_voice,
+                                st.session_state.get("voice_type", "All"),
+                            ),
+                            skip_fish=bool(selected_voice.get("backup_only")),
                         )
 
                         if card_title:
-                            title_bytes, title_words = (
-                                generate_narration_audio_with_words(
-                                    text=card_title,
-                                    voice_name=selected_voice["ShortName"],
-                                    speed=speed,
-                                )
-                            )
+                            title_bytes, title_words = spoken[0]
+                            script_bytes, script_words = spoken[1]
                             title_duration = probe_mp3_duration_seconds(title_bytes)
                             audio_bytes = concat_mp3_bytes(
                                 title_bytes,
@@ -974,21 +1252,24 @@ with preview_col:
                             caption_word_timings = title_words + script_words
                         else:
                             title_duration = 0.0
-                            audio_bytes = script_bytes
-                            caption_word_timings = script_words
+                            audio_bytes, caption_word_timings = spoken[0]
 
                     st.session_state["narration_audio"] = audio_bytes
                     st.session_state["narration_script"] = script_text
                     st.session_state["title_audio_duration"] = title_duration
                     st.session_state["caption_word_timings"] = caption_word_timings
+                    st.session_state["narration_voice_note"] = note
 
                     st.toast(
-                        "Narration audio generated successfully.",
+                        note or "Narration audio generated successfully.",
                         icon="✅",
                     )
 
                 except Exception as e:
                     st.error(f"Could not generate narration: {e}")
+
+    if st.session_state.get("narration_voice_note"):
+        st.info(st.session_state["narration_voice_note"])
 
     if st.session_state.get("narration_audio"):
         st.audio(
